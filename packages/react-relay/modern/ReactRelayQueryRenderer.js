@@ -307,13 +307,29 @@ function fetchQueryAndComputeStateFromProps(
       // Use network data first, since it may be fresher
       const snapshot = querySnapshot || storeSnapshot;
       if (!snapshot) {
-        return {
-          error: null,
-          relayContextEnvironment: environment,
-          relayContextVariables: operation.variables,
-          renderProps: getLoadingRenderProps(),
-          snapshot: null,
-        };
+        throw new Promise((resolve, reject) => {
+          queryFetcher.setOnDataChange(({error, snapshot}) => {
+            if (typeof retryCallbacks.handleDataChange === 'function') {
+              retryCallbacks.handleDataChange({error, snapshot});
+            }
+            if (error) {
+              reject(error);
+            } else if (snapshot) {
+              resolve();
+            }
+          });
+        });
+        // this shows the fallback of loading state. In the new API after suspense,
+        // the fallback should be provided from the outside Placeholder so this
+        // shouldn't be needed anymore
+
+        // return {
+        //   error: null,
+        //   relayContextEnvironment: environment,
+        //   relayContextVariables: operation.variables,
+        //   renderProps: getLoadingRenderProps(),
+        //   snapshot: null,
+        // };
       }
 
       return {
