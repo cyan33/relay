@@ -84,7 +84,7 @@ type State = {
  * - Renders the pending/fail/success states with the provided render function.
  * - Subscribes for updates to the root data and re-renders with any changes.
  */
-class ReactRelayQueryRenderer extends React.Component<Props, State> {
+class ReactRelaySuspenseQueryRenderer extends React.Component<Props, State> {
   // TODO T25783053 Update this component to use the new React context API,
   // Once we have confirmed that it's okay to raise min React version to 16.3.
   static childContextTypes = {
@@ -96,6 +96,7 @@ class ReactRelayQueryRenderer extends React.Component<Props, State> {
     environment: (this.props.environment: IEnvironment),
     variables: this.props.variables,
   };
+  _hasStartedFetching: boolean = false;
 
   constructor(props: Props, context: Object) {
     super(props, context);
@@ -123,6 +124,10 @@ class ReactRelayQueryRenderer extends React.Component<Props, State> {
         props,
         queryFetcher,
         retryCallbacks,
+        this._hasStartedFetching, // hasStartedFetching
+        () => {
+          this._hasStartedFetching = true;
+        },
       ),
     };
   }
@@ -144,6 +149,10 @@ class ReactRelayQueryRenderer extends React.Component<Props, State> {
           nextProps,
           prevState.queryFetcher,
           prevState.retryCallbacks,
+          this._hasStartedFetching,
+          () => {
+            this._hasStartedFetching = true;
+          },
         ),
       };
     }
@@ -152,40 +161,10 @@ class ReactRelayQueryRenderer extends React.Component<Props, State> {
   }
 
   componentDidMount() {
-    const {retryCallbacks, queryFetcher} = this.state;
-
-    retryCallbacks.handleDataChange = (params: {
-      error?: Error,
-      snapshot?: Snapshot,
-    }): void => {
-      const error = params.error == null ? null : params.error;
-      const snapshot = params.snapshot == null ? null : params.snapshot;
-
-      this.setState(prevState => {
-        // Don't update state if nothing has changed.
-        if (snapshot === prevState.snapshot && error === prevState.error) {
-          return null;
-        }
-        return {
-          renderProps: getRenderProps(
-            error,
-            snapshot,
-            queryFetcher,
-            retryCallbacks,
-          ),
-          snapshot,
-        };
-      });
-    };
+    const {retryCallbacks} = this.state;
 
     retryCallbacks.handleRetryAfterError = (error: Error) =>
       this.setState({renderProps: getLoadingRenderProps()});
-
-    // Re-initialize the ReactRelayQueryFetcher with callbacks.
-    // If data has changed since constructions, this will re-render.
-    if (this.props.query) {
-      queryFetcher.setOnDataChange(retryCallbacks.handleDataChange);
-    }
   }
 
   componentWillUnmount(): void {
@@ -279,7 +258,9 @@ function fetchQueryAndComputeStateFromProps(
   props: Props,
   queryFetcher: ReactRelayQueryFetcher,
   retryCallbacks: RetryCallbacks,
-): $Shape<State> {
+  hasStartedFetching,
+  callbackAfterFetching,
+): $Shape<State> | null {
   const {environment, query, variables} = props;
   if (query) {
     // $FlowFixMe TODO t16225453 QueryRenderer works with old+new environment.
@@ -292,51 +273,62 @@ function fetchQueryAndComputeStateFromProps(
     const request = getRequest(query);
     const operation = createOperationSelector(request, variables);
 
-    try {
-      const storeSnapshot =
-        props.dataFrom === STORE_THEN_NETWORK
-          ? queryFetcher.lookupInStore(genericEnvironment, operation)
-          : null;
-      const querySnapshot = queryFetcher.fetch({
+    // this was previously wrapped in a try catch block
+    // we remove it because the error should be handled in an ErrorBoundary
+    // outside of Relay in the future. Also since we are throwing
+    // a promise here, it'd be hard (although do-able) to use a single
+    // try-caetch to handle a thrown promise and an error at the same time
+    const storeSnapshot =
+      props.dataFrom === STORE_THEN_NETWORK
+        ? queryFetcher.lookupInStore(genericEnvironment, operation)
+        : null;
+
+    let querySnapshot;
+    // for the time being, we set hasStartedFetching to true once we issue the
+    // fetching process, but we need a mechanism to update this indicator
+    // when handling updating
+    if (!hasStartedFetching) {
+      querySnapshot = queryFetcher.fetch({
         cacheConfig: props.cacheConfig,
         dataFrom: props.dataFrom,
         environment: genericEnvironment,
         onDataChange: retryCallbacks.handleDataChange,
         operation,
       });
-      // Use network data first, since it may be fresher
-      const snapshot = querySnapshot || storeSnapshot;
-      if (!snapshot) {
-        return {
-          error: null,
-          relayContextEnvironment: environment,
-          relayContextVariables: operation.variables,
-          renderProps: getLoadingRenderProps(),
-          snapshot: null,
-        };
+      if (callbackAfterFetching) {
+        callbackAfterFetching();
       }
-
-      return {
-        error: null,
-        relayContextEnvironment: environment,
-        relayContextVariables: operation.variables,
-        renderProps: getRenderProps(
-          null,
-          snapshot,
-          queryFetcher,
-          retryCallbacks,
-        ),
-        snapshot,
-      };
-    } catch (error) {
-      return {
-        error,
-        relayContextEnvironment: environment,
-        relayContextVariables: operation.variables,
-        renderProps: getRenderProps(error, null, queryFetcher, retryCallbacks),
-        snapshot: null,
-      };
     }
+    // Use network data first, since it may be fresher
+    const snapshot = querySnapshot || storeSnapshot;
+    if (!snapshot) {
+      // if we don't have a cached snapshot, we need to suspend rendering
+      // by throwing a promise
+      throw new Promise(resolve => {
+        queryFetcher.setOnDataChange(params => {
+          if (params.error) {
+            // we throw an actual error here to let the outer
+            // ErrorBoundary catch it
+            throw new Error(params.error);
+          }
+          if (params.snapshot) {
+            // if we resolve, React is gonna re-render.
+            // Through this, we give React the chance to know when to re-render,
+            // and we might not need explicitly put setState in setOnDataChange in
+            // componentDidMount as we previously did
+            resolve();
+          }
+        });
+      });
+    }
+
+    return {
+      error: null,
+      relayContextEnvironment: environment,
+      relayContextVariables: operation.variables,
+      renderProps: getRenderProps(null, snapshot, queryFetcher, retryCallbacks),
+      snapshot,
+    };
   } else {
     queryFetcher.dispose();
 
@@ -349,4 +341,4 @@ function fetchQueryAndComputeStateFromProps(
   }
 }
 
-module.exports = ReactRelayQueryRenderer;
+module.exports = ReactRelaySuspenseQueryRenderer;
